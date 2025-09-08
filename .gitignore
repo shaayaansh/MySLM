@@ -1,0 +1,16 @@
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
+
+# Conda lock/cache
+.conda/
+*.conda
+
+# VS Code
+.vscode/
+
+# Data (keep the folder, ignore contents)
+data/*
+!data/.gitkeep
