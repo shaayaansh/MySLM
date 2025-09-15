@@ -4,6 +4,7 @@ import regex as re
 import json
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from utils import parallelize_tokenize_file
 from typing import Tuple, List
 from collections import Counter
 import unicodedata as ud
