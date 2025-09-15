@@ -5,19 +5,86 @@ import json
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from utils import parallelize_tokenize_file
-from typing import Tuple, List
+from typing import List, Tuple, Iterable, Iterator, Optional, Union
 from collections import Counter
 import unicodedata as ud
 
 class BytePairEncodingTokenizer():
-    def __init__(self, data_path):
+    def __init__(self, vocab=None, merges=None, special_tokens=None):
         super().__init__()
-        self.data_path = data_path
+        
         self.merges = []
         self.merge_ranks = {}
         self.b2u, self.u2b = self._bytes_to_unicode()
         self.token_to_id = {}
         self.id_to_token = []
+
+        self.special_tokens = list(special_tokens) if special_tokens else []
+        self.special_tokens_set = set(self.special_tokens)
+
+        self.DEFAULT_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        self._word_re = re.compile(self.DEFAULT_PAT)
+
+        if vocab is not None:
+            self._load_vocab(vocab)
+        if merges is not None:
+            self._load_merges(merges)
+  
+    def _load_vocab(self, vocab):
+        if isinstance(vocab, (str, Path)):
+            with Path(vocab).open("r", encoding="utf-8") as f:
+                vocab = json.load(f)
+        
+        if isinstance(vocab, list):
+            self.id_to_token = [str(t) for t in vocab]
+            self.token_to_id = {t: i for i, t in enumerate(vocab)}
+        
+        elif isinstance(vocab, dict):
+            tok2id = {str(k): int(v) for k, v in vocab.items()}
+            size = 1 + max(tok2id.values()) if tok2id else 0
+            id2tok = [None] * size
+
+            for tok, idx in tok2id.items():
+                if 0 <= idx < size and id2tok[idx] is None:
+                    id2tok[idx] = tok
+                else:
+                    raise ValueError("vocab has non-contiguous or duplicate ids.")
+            
+            if any(t is None for t in id2tok):
+                missing = [i for i, t in enumerate(id2tok) if t is None][:20]
+                raise ValueError(f"vocab has gaps in ids; example missing: {missing}")
+            
+            self.token_to_id = tok2id
+            self.id_to_token = id2tok
+        
+        else:
+            raise TypeError("vocab must be a path, list[str], or dict[str,int].")
+        
+    def _load_merges(self, merges):
+        if isinstance(merges, (str, Path)):
+            pairs: List[Tuple[str, str]] = []
+            with Path(merges).open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    
+                    a, b = line.split(" ", 1)
+                    pairs.append((a, b))
+        else:
+            pairs = list(merges)
+        
+        self.merges = pairs
+        self.merge_ranks = {pair: i for i, pair in enumerate(self.merges)}
+
+
+    @classmethod
+    def from_files(cls, vocab_path, merges_path, special_tokens=None):
+        self = cls(special_tokens=special_tokens)
+        self._load_vocab(vocab_path)
+        self._load_merges(merges_path)
+
+        return self
 
     def _bytes_to_unicode(self):
         # visible ranges (don’t collide with space or control chars)
@@ -34,58 +101,6 @@ class BytePairEncodingTokenizer():
         b2u = {b: chr(c) for b, c in zip(bs, cs)}   # byte -> unicode char
         u2b = {v: k for k, v in b2u.items()}        # unicode char -> byte
         return b2u, u2b
-    
-    @classmethod
-    def from_files(cls, vocab_path, merges_path):
-
-        self = cls(data_path=None)
-
-        vocab_path = Path(vocab_path)
-        merges_path = Path(merges_path)
-
-        with vocab_path.open("r", encoding="utf-8") as f:
-            vocab = json.load(f)
-
-        if isinstance(vocab, dict):
-            self.token_to_id = {str(k): int(v) for k, v in vocab.items()}
-            size = 1 + max(self.token_to_id.values()) if self.token_to_id else 0
-            self.id_to_token = [None] * size
-            for tok, idx in self.token_to_id.items():
-                if 0 <= idx < size and self.id_to_token[idx] is None:
-                    self.id_to_token[idx] = tok
-                else:
-                    raise ValueError("vocab.json has non-contiguous or duplicate ids.")
-                
-            if any(t is None for t in self.id_to_token):
-                raise ValueError("vocab.json has gaps in ids.")
-                
-        elif isinstance(vocab, list):
-            self.id_to_token = [str(t) for t in vocab]
-            self.token_to_id = {t: i for i, t in enumerate(self.id_to_token)}
-    
-        else:
-            raise TypeError("vocab file must be a dict or list.")
-        
-
-        merges = []
-        with merges_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                parts = line.split(" ", 1) # split on first space
-                if len(parts) != 2:
-                    raise ValueError(f"Malformed merge line: {line}")
-                
-                a, b = parts[0], parts[1]
-                merges.append((a, b))
-
-        self.merges = merges
-        self.merge_ranks = {pair: i for i, pair in enumerate(self.merges)}
-
-
-        return self
 
 
     def initialize_vocabulary(self, special_tokens):
@@ -214,12 +229,11 @@ class BytePairEncodingTokenizer():
 
         return symbols
     
-    def tokens_to_ids(self, tokens: List[str], strict: bool = False) -> List[int]:
-        ids: List[int] = []
+    def _tokens_to_ids_iter(self, tokens: Iterable[str], strict: bool = False) -> Iterator[int]:
         for tok in tokens:
             tid = self.token_to_id.get(tok)
             if tid is not None:
-                ids.append(tid)
+                yield tid
             elif strict:
                 raise KeyError(f"Unknown token: {tok!r}")
             else:
@@ -227,17 +241,41 @@ class BytePairEncodingTokenizer():
                     base_id = self.token_to_id.get(ch)
                     if base_id is None:
                         raise KeyError(f"Missing base byte token for {ch!r}")
-                    ids.append(base_id)
-
-        return ids
+                    yield base_id
     
 
     def encode(self, text: str, return_str_tokens: bool = False):
-        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        str_tokens: List[str] = []
-        for word in re.findall(PAT, text):
-            str_tokens.extend(self._encode_word(word))
+        if return_str_tokens:
+            str_tokens = []
+            for w in self._word_re.findall(text):
+                str_tokens.extend(self._encode_word(w))
 
-        ids = self.tokens_to_ids(str_tokens, strict=False)
+            ids = list(self._tokens_to_ids_iter(str_tokens, strict=False))
+            return ids, str_tokens
+        
+        ids_iter = (
+            tid
+            for w in self._word_re.findall(text)
+            for tid in self._tokens_to_ids_iter(self._encode_word(w), strict=False)
+        )
 
-        return (ids, str_tokens) if return_str_tokens else ids 
+        return list(ids_iter)
+    
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Lazily yield token IDs from an iterable of strings.
+        Memory-efficient for huge files.
+        """
+        for chunk in iterable:
+            for w in self._word_re.findall(chunk):
+                yield from self._tokens_to_ids_iter(self._encode_word(w), strict=False)
+        
+
+    def decode(self, ids: List[int]) -> str:
+        byte_vals = []
+        for i in ids:
+            tok = self.id_to_token[i]
+            for ch in tok:
+                byte_vals.append(self.u2b[ch])
+
+        return bytes(byte_vals).decode("utf-8", errors="strict")
