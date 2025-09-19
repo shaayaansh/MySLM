@@ -17,3 +17,20 @@ class Linear(nn.Module):
             x, self.weights,
             "... d_in, d_out d_in -> ... d_out"
         )
+    
+
+class Embedding(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        embeddings = torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype)
+        self.embeddings = nn.Parameter(embeddings)
+        nn.init.trunc_normal_(self.embeddings, mean=0, std=1, a=-3, b=3)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if token_ids.dtype != torch.long:
+            raise TypeError("token_ids should be of type long.")
+        if torch.any((token_ids < 0) | (token_ids >= self.num_embeddings)):
+            raise IndexError("token_ids out of range for embedding matrix")
+        
+        return self.embeddings[token_ids]
