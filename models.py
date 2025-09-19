@@ -34,3 +34,23 @@ class Embedding(nn.Module):
             raise IndexError("token_ids out of range for embedding matrix")
         
         return self.embeddings[token_ids]
+    
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+        super().__init__()
+        self.dtype = dtype
+        self.d_model = d_model
+        self.eps = eps
+        gain_tensor = torch.ones(d_model, device=device, dtype=dtype)
+        self.gain = nn.Parameter(gain_tensor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+        mean_sq = einsum(x**2, "... d_model -> ...") / self.d_model
+        rms_x = torch.sqrt(mean_sq + self.eps)
+        result = einsum((x / rms_x), self.gain, "... d_model, d_model -> ... d_model")
+        result = result.to(in_dtype)
+
+        return result
