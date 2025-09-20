@@ -79,3 +79,40 @@ class PositionWiseFeedForward(nn.Module):
         x = self.linear_2(x)
 
         return x
+    
+
+
+class Rope(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+
+        k = torch.arange(d_k // 2, device=device)
+        freqs = self.theta ** (-2.0 * k / float(self.d_k))
+
+        pos = torch.arange(max_seq_len, device=device)
+        phases = einsum(pos, freqs, "max_len, d_k_2 -> max_len d_k_2")
+        self.sins = torch.sin(phases)
+        self.cosines = torch.cos(phases)
+        
+        self.register_buffer("rope_cosines", self.cosines, persistent=False)
+        self.register_buffer("rope_sins", self.sins, persistent=False)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        sins = self.rope_sins[token_positions] # (seq_len, d_k/2)
+        cosines = self.rope_cosines[token_positions] # (seq_len, d_k/2)
+
+        x_even = x[..., 0::2] # (b, seq_len, d_k/2)
+        x_odd = x[..., 1::2] # (b, seq_len, d_k/2)
+
+        x_even_rot = einsum(x_even, cosines, "... seq_len d_k_2, ... seq_len d_k_2 -> ... seq_len d_k_2") - \
+            einsum(x_odd, sins, "... seq_len d_k_2, ... seq_len d_k_2 -> ... seq_len d_k_2") # (b, seq_len, d_k/2)
+        x_odd_rot = einsum(x_even, sins, "... seq_len d_k_2, ... seq_len d_k_2 -> ... seq_len d_k_2") + \
+            einsum(x_odd, cosines, "... seq_len d_k_2, ... seq_len d_k_2 -> ... seq_len d_k_2") # (b, seq_len, d_k/2)
+        
+        combined = torch.cat([x_even_rot[..., None], x_odd_rot[..., None]], dim=-1)
+        x_rot = rearrange(combined, "... d_k two -> ... (d_k two)")
+
+        return x_rot
