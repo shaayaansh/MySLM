@@ -1,4 +1,5 @@
 import torch
+import math
 import torch.nn as nn
 from math import sqrt
 from einops import rearrange, einsum
@@ -54,3 +55,27 @@ class RMSNorm(nn.Module):
         result = result.to(in_dtype)
 
         return result
+    
+
+class PositionWiseFeedForward(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
+        dff_raw = (8 * self.d_model) / 3
+        out_features = int(math.ceil(dff_raw/64) * 64)
+        self.linear_1 = Linear(d_model, out_features)
+        self.linear_2 = Linear(out_features, d_model)
+        self.linear_3 = Linear(d_model, out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w1x = self.linear_1(x)
+        silu_w1x = einsum(
+            w1x, 
+            torch.sigmoid(w1x), 
+            "... features_out, ... features_out -> ... features_out"
+        )
+        w3x = self.linear_3(x)
+        x = einsum(silu_w1x, w3x, "... d_ff, ... d_ff -> ... d_ff")
+        x = self.linear_2(x)
+
+        return x
