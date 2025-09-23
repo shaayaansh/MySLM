@@ -37,20 +37,25 @@ class Embedding(nn.Module):
     
 
 class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+    def __init__(self, d_model: int, eps: float = 1e-5, weights=None, device=None, dtype=None):
         super().__init__()
         self.dtype = dtype
         self.d_model = d_model
         self.eps = eps
-        gain_tensor = torch.ones(d_model, device=device, dtype=dtype)
+
+        if weights is not None:
+        gain_tensor = weights
+        else:
+        gain_tensor = torch.ones(self.d_model, device=device, dtype=dtype)
+        
         self.gain = nn.Parameter(gain_tensor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
         x = x.to(torch.float32)
-        mean_sq = einsum(x**2, "... d_model -> ...") / self.d_model
+        mean_sq = (x**2).mean(dim=-1, keepdim=True)
         rms_x = torch.sqrt(mean_sq + self.eps)
-        result = einsum((x / rms_x), self.gain, "... d_model, d_model -> ... d_model")
+        result = (x / rms_x) * self.gain
         result = result.to(in_dtype)
 
         return result
@@ -135,7 +140,6 @@ class MultiheadSelfAttention(nn.Module):
         scaled_qk = qk / math.sqrt(d_k)
 
         if mask is not None:
-            assert mask.shape == scaled_qk.shape[-2:], "mask shape mismatch"
             scaled_qk = scaled_qk.masked_fill(mask, float("-inf"))
 
         attn_weights = softmax(scaled_qk, dim=-1)
