@@ -8,7 +8,6 @@ class Linear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):     
         super().__init__()   
         
-        
         self.weights = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype, device=device))
         std = sqrt(2 / (in_features + out_features))
         nn.init.trunc_normal_(self.weights, mean=0.0, std=std, a=-3*std, b=3*std)
@@ -116,3 +115,55 @@ class Rope(nn.Module):
         x_rot = rearrange(combined, "... d_k two -> ... (d_k two)")
 
         return x_rot
+
+
+class MultiheadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = self.d_model // num_heads
+
+        self.weights_q = nn.Linear(d_model, num_heads * self.d_k)
+        self.weights_k = nn.Linear(d_model, num_heads * self.d_k)
+        self.weights_v = nn.Linear(d_model, num_heads * self.d_k)
+        self.output_layer = nn.Linear(num_heads * self.d_k, d_model)
+
+    def _scaled_dot_product_attention(self, q, k, v, mask=None):
+        qk = einsum(q, k, "... seq d_k, ... seq2 d_k -> ... seq seq2")
+        d_k = self.d_k
+        scaled_qk = qk / math.sqrt(d_k)
+
+        if mask is not None:
+            assert mask.shape == scaled_qk.shape[-2:], "mask shape mismatch"
+            scaled_qk = scaled_qk.masked_fill(mask, float("-inf"))
+
+        attn_weights = softmax(scaled_qk, dim=-1)
+        output = einsum(attn_weights, v, "... seq seq2, ... seq2 d_v -> ... seq d_v")
+
+        return output, attn_weights
+
+    def forward(self, x):
+        seq_len = x.shape[-2]
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+
+        q = self.weights_q(x) # (b, seq, nheads*d_k)
+        k = self.weights_k(x) # (b, seq, nheads*d_k)
+        v = self.weights_v(x) # (b, seq, nheads*d_k)
+
+        q = rearrange(q, "... seq_len (nheads d_k) -> ... nheads seq_len d_k", nheads=self.num_heads) # (b, nheads, seq, d_k)
+        k = rearrange(k, "... seq_len (nheads d_k) -> ... nheads seq_len d_k", nheads=self.num_heads) # (b, nheads, seq, d_k)
+        v = rearrange(v, "... seq_len (nheads d_k) -> ... nheads seq_len d_k", nheads=self.num_heads) # (b, nheads, seq, d_k)
+
+        outputs, attn_weights = self._scaled_dot_product_attention(q, k, v, mask=mask)
+
+        outputs = rearrange(outputs, "... nheads seq_len d_k -> ... seq_len (nheads d_k)")
+        outputs = self.output_layer(outputs)
+
+        return outputs
+
+
+def softmax(x: torch.Tensor, dim: int=-1) -> torch.Tensor:
+    max_vals, _ = torch.max(x, dim=dim, keepdim=True)
+    x_exp = torch.exp(x - max_vals)
+    return x_exp / torch.sum(x_exp, dim=dim, keepdim=True)
