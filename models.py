@@ -5,12 +5,14 @@ from math import sqrt
 from einops import rearrange, einsum
 
 class Linear(nn.Module):
-    def __init__(self, in_features, out_features, device=None, dtype=None):     
+    def __init__(self, in_features, out_features, weights=None, device=None, dtype=None):     
         super().__init__()   
-        
-        self.weights = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype, device=device))
-        std = sqrt(2 / (in_features + out_features))
-        nn.init.trunc_normal_(self.weights, mean=0.0, std=std, a=-3*std, b=3*std)
+        if weights is not None:
+            self.weights = weights
+        else:
+            self.weights = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype, device=device))
+            std = sqrt(2 / (in_features + out_features))
+            nn.init.trunc_normal_(self.weights, mean=0.0, std=std, a=-3*std, b=3*std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return einsum(
@@ -20,12 +22,16 @@ class Linear(nn.Module):
     
 
 class Embedding(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+    def __init__(self, num_embeddings, embedding_dim, embeddings=None, device=None, dtype=None):
         super().__init__()
         self.num_embeddings = num_embeddings
-        embeddings = torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype)
-        self.embeddings = nn.Parameter(embeddings)
-        nn.init.trunc_normal_(self.embeddings, mean=0, std=1, a=-3, b=3)
+
+        if embeddings is not None:
+            self.embeddings = nn.Parameter(embeddings)
+        else:
+            embeddings = torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype)
+            self.embeddings = nn.Parameter(embeddings)
+            nn.init.trunc_normal_(self.embeddings, mean=0, std=1, a=-3, b=3)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         if token_ids.dtype != torch.long:
@@ -44,9 +50,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
         if weights is not None:
-        gain_tensor = weights
+            gain_tensor = weights
         else:
-        gain_tensor = torch.ones(self.d_model, device=device, dtype=dtype)
+            gain_tensor = torch.ones(self.d_model, device=device, dtype=dtype)
         
         self.gain = nn.Parameter(gain_tensor)
 
@@ -61,15 +67,21 @@ class RMSNorm(nn.Module):
         return result
     
 
+
 class PositionWiseFeedForward(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model, dff=None, w1_weight=None, w2_weight=None, w3_weight=None):
         super().__init__()
         self.d_model = d_model
-        dff_raw = (8 * self.d_model) / 3
+
+        if dff is not None:
+            dff_raw = dff
+        else:
+            dff_raw = (8 * self.d_model) / 3
+
         out_features = int(math.ceil(dff_raw/64) * 64)
-        self.linear_1 = Linear(d_model, out_features)
-        self.linear_2 = Linear(out_features, d_model)
-        self.linear_3 = Linear(d_model, out_features)
+        self.linear_1 = Linear(d_model, out_features, weights=w1_weight)
+        self.linear_2 = Linear(out_features, d_model, weights=w2_weight)
+        self.linear_3 = Linear(d_model, out_features, weights=w3_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w1x = self.linear_1(x)
@@ -84,7 +96,6 @@ class PositionWiseFeedForward(nn.Module):
 
         return x
     
-
 
 class Rope(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
@@ -123,26 +134,41 @@ class Rope(nn.Module):
 
 
 class MultiheadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int):
+    def __init__(
+        self, 
+        d_model: int, 
+        num_heads: int, 
+        theta: float,
+        max_seq_len: int,
+        q_proj_weight=None, 
+        k_proj_weight=None, 
+        v_proj_weight=None, 
+        o_proj_weight=None,
+    ):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = self.d_model // num_heads
 
-        self.weights_q = nn.Linear(d_model, num_heads * self.d_k)
-        self.weights_k = nn.Linear(d_model, num_heads * self.d_k)
-        self.weights_v = nn.Linear(d_model, num_heads * self.d_k)
-        self.output_layer = nn.Linear(num_heads * self.d_k, d_model)
+        self.theta = theta
+        self.max_seq_len = max_seq_len
+
+        self.weights_q = Linear(d_model, num_heads * self.d_k, weights=q_proj_weight)
+        self.weights_k = Linear(d_model, num_heads * self.d_k, weights=k_proj_weight)
+        self.weights_v = Linear(d_model, num_heads * self.d_k, weights=v_proj_weight)
+        self.output_layer = Linear(num_heads * self.d_k, d_model, weights= o_proj_weight)
+        self.rope = Rope(theta=self.theta, d_k=self.d_k, max_seq_len=self.max_seq_len)
 
     def _scaled_dot_product_attention(self, q, k, v, mask=None):
-        qk = einsum(q, k, "... seq d_k, ... seq2 d_k -> ... seq seq2")
+        k_rearr = rearrange(k, "... seq d_k -> ... d_k seq")
+        qk = einsum(q, k_rearr, "... seq d_k, ... d_k seq2 -> ... seq seq2")
         d_k = self.d_k
         scaled_qk = qk / math.sqrt(d_k)
 
         if mask is not None:
             scaled_qk = scaled_qk.masked_fill(mask, float("-inf"))
 
-        attn_weights = softmax(scaled_qk, dim=-1)
+        attn_weights = torch.softmax(scaled_qk, dim=-1)
         output = einsum(attn_weights, v, "... seq seq2, ... seq2 d_v -> ... seq d_v")
 
         return output, attn_weights
@@ -159,6 +185,9 @@ class MultiheadSelfAttention(nn.Module):
         k = rearrange(k, "... seq_len (nheads d_k) -> ... nheads seq_len d_k", nheads=self.num_heads) # (b, nheads, seq, d_k)
         v = rearrange(v, "... seq_len (nheads d_k) -> ... nheads seq_len d_k", nheads=self.num_heads) # (b, nheads, seq, d_k)
 
+        q = self.rope(q, torch.arange(seq_len))
+        k = self.rope(k, torch.arange(seq_len))
+
         outputs, attn_weights = self._scaled_dot_product_attention(q, k, v, mask=mask)
 
         outputs = rearrange(outputs, "... nheads seq_len d_k -> ... seq_len (nheads d_k)")
@@ -171,3 +200,5 @@ def softmax(x: torch.Tensor, dim: int=-1) -> torch.Tensor:
     max_vals, _ = torch.max(x, dim=dim, keepdim=True)
     x_exp = torch.exp(x - max_vals)
     return x_exp / torch.sum(x_exp, dim=dim, keepdim=True)
+
+
