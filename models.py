@@ -3,6 +3,7 @@ import math
 import torch.nn as nn
 from math import sqrt
 from einops import rearrange, einsum
+import re
 
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, weights=None, device=None, dtype=None):     
@@ -251,4 +252,70 @@ class TransformerBlock(nn.Module):
         return x_out
         
 
+class TransformerLM(nn.Module):
+    def __init__(
+            self, 
+            vocab_size: int, 
+            context_length: int,
+            d_model: int,
+            num_layers: int,
+            num_heads: int,
+            d_ff: int,
+            rope_theta: float,
+            weights: dict[str, torch.Tensor],
+    ):
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        self.embeddings = Embedding(self.vocab_size, self.d_model) if weights is None else weights["token_embeddings"]
+
+        weights_ln_final = weights.get("ln_final.weight") if weights is not None else None
+        weights_lm_head = weights.get("lm_head.weight") if weights is not None else None
+
+        weights_dict = self._reorganize_weights(weights=weights)
+        self.transformer_blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    self.d_model, 
+                    self.num_heads, 
+                    self.d_ff, 
+                    self.context_length, 
+                    self.rope_theta,
+                    weights_dict[i]
+                ) for i in range(self.num_layers)
+            ]
+        )
+
+        self.rms_norm = RMSNorm(self.d_model, weights=weights_ln_final)
+        self.lm_head = Linear(self.d_model, self.vocab_size, weights=weights_lm_head)
+
+    def forward(self, x):
+        embeddings = self.embeddings(x)
+        transformer_output = self.transformer_blocks(embeddings)
+        normalized = self.rms_norm(transformer_output)
+        linear_output = self.lm_head(normalized)
+        probs = torch.softmax(linear_output, dim=-1)
+
+        return probs
+
+
+    def _reorganize_weights(self, weights):
+        pattern = r"^layers\.(\d+)\."
+        weights_dictionary = {}
+        for k, v in weights.items():
+            if k.startswith("layers."):
+                match = re.match(pattern, k)
+                if match:
+                    layer_num = int(match.group(1))  # e.g., "3"
+                    new_key = k.replace(f"layers.{layer_num}.", "")  # strip prefix
+
+                    if layer_num not in weights_dictionary:
+                        weights_dictionary[layer_num] = {}
+
+                    weights_dictionary[layer_num][new_key] = v
+        return weights_dictionary
 
