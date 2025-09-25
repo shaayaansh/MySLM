@@ -202,3 +202,53 @@ def softmax(x: torch.Tensor, dim: int=-1) -> torch.Tensor:
     return x_exp / torch.sum(x_exp, dim=dim, keepdim=True)
 
 
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float=None, weights: dict[str, torch.Tensor]=None):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.max_seq_len = max_seq_len
+
+        weights_q = weights.get("attn.q_proj.weight") if weights is not None else None
+        weights_k = weights.get("attn.k_proj.weight") if weights is not None else None
+        weights_v = weights.get("attn.v_proj.weight") if weights is not None else None
+        weights_o = weights.get("attn.output_proj.weight") if weights is not None else None
+        weights_ff1 = weights.get("ffn.w1.weight") if weights is not None else None
+        weights_ff2 = weights.get("ffn.w2.weight") if weights is not None else None
+        weights_ff3 = weights.get("ffn.w3.weight") if weights is not None else None
+        weights_ln1 = weights.get("ln1.weight") if weights is not None else None
+        weights_ln2 = weights.get("ln2.weight") if weights is not None else None
+
+        self.mh_attn = MultiheadSelfAttention(
+            self.d_model, 
+            self.num_heads, 
+            max_seq_len=self.max_seq_len,
+            theta=theta,
+            q_proj_weight=weights_q, 
+            k_proj_weight=weights_k, 
+            v_proj_weight=weights_v, 
+            o_proj_weight= weights_o
+        )
+        self.rms_norm1 = RMSNorm(self.d_model, weights=weights_ln1)
+        self.rms_norm2 = RMSNorm(self.d_model, weights=weights_ln2)
+        self.ff = PositionWiseFeedForward(
+            self.d_model, self.d_ff, 
+            w1_weight=weights_ff1, 
+            w2_weight=weights_ff2, 
+            w3_weight=weights_ff3
+        )
+
+    def forward(self, x):
+        x_norm = self.rms_norm1(x)
+        x_attn = self.mh_attn(x_norm)
+        x_res = x + x_attn
+        x_norm_norm = self.rms_norm2(x_res)
+        x_ff = self.ff(x_norm_norm)
+        x_out = x_res + x_ff
+
+        return x_out
+        
+
+
