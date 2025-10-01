@@ -319,3 +319,30 @@ class TransformerLM(nn.Module):
                     weights_dictionary[layer_num][new_key] = v
         return weights_dictionary
 
+
+
+def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor):
+    """
+    logits: (B, V) for classification OR (B, T, V) for seq2seq/language modeling
+    targets: (B,) or (B, T) with integer class indices
+    """
+    if logits.ndim == 3:
+        # (B, T, V) → (B*T, V)
+        flat_logits = rearrange(logits, 'b t v -> (b t) v')
+        flat_targets = rearrange(targets, 'b t -> (b t)')
+    elif logits.ndim == 2:
+        # (B, V)
+        flat_logits, flat_targets = logits, targets
+    else:
+        raise ValueError(f"Unsupported logits shape {logits.shape}")
+
+    max_values = flat_logits.max(dim=1, keepdim=True).values
+    reduced_logits = flat_logits - max_values 
+    log_sum_exp = torch.log(torch.sum(torch.exp(reduced_logits), dim=1))
+
+    
+    idx = torch.arange(flat_logits.size(0), device=logits.device)
+    target_logits = reduced_logits[idx, flat_targets]  
+
+    loss = (log_sum_exp - target_logits).mean()
+    return loss
