@@ -346,3 +346,44 @@ def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor):
 
     loss = (log_sum_exp - target_logits).mean()
     return loss
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        
+        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+        super().__init__(params, defaults)
+
+    def step(self, closure = None):
+        loss = None if closure is None else closure
+        
+        for group in self.param_groups:
+            lr = group['lr'] # get learning rate for param groups
+            lr_initial = lr
+            b1, b2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                
+                state = self.state[p]
+                if len(state) == 0:
+                    state["m"] = torch.zeros_like(p.grad.data) # first moment
+                    state["v"] = torch.zeros_like(p.grad.data) # second moment
+                
+                t = state.get("t", 0)
+                grad = p.grad.data
+
+                state["m"] = b1 * state["m"] + (1 - b1) * grad
+                state["v"] = b2 * state["v"] + (1 - b2) * (grad ** 2)
+                lr_t = lr * math.sqrt(1 - b2**(t+1)) / (1 - b1**(t+1))
+                
+                p.data -= lr_t * state["m"] / (torch.sqrt(state["v"]) + eps)
+                p.data -= lr * wd * p
+                state["t"] = t + 1
+                
+        return loss
