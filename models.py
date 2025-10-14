@@ -4,6 +4,7 @@ import torch.nn as nn
 from math import sqrt
 from einops import rearrange, einsum
 import re
+from typing import Iterable
 
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, weights=None, device=None, dtype=None):     
@@ -346,6 +347,36 @@ def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor):
 
     loss = (log_sum_exp - target_logits).mean()
     return loss
+
+
+def cosine_annealing_lr(t: int, alpha_max: float, alpha_min: float, T_w: int, T_c: int) -> float:
+    """
+    Compute the learning rate at iteration t using cosine annealing with warm-up.
+    """
+    if t < T_w:
+        return (t / T_w) * alpha_max
+    elif t <= T_c:
+        cos_term = math.cos(math.pi * (t - T_w) / (T_c - T_w))
+        return alpha_min + 0.5 * (1 + cos_term) * (alpha_max - alpha_min)
+    else:
+        return alpha_min
+    
+
+def clip_gradients(params: Iterable[torch.nn.Parameter], max_norm: float, eps=1e-6):
+    total_norm = 0.0
+    for p in params:
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    
+    total_norm = math.sqrt(total_norm)
+
+    clip_coef = max_norm / (total_norm + eps)
+    clip_coef = min(clip_coef, 1.0)
+
+    for p in params:
+        if p.grad is not None:
+            p.grad.data.mul_(clip_coef)
 
 
 class AdamW(torch.optim.Optimizer):
