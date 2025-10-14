@@ -69,6 +69,10 @@ def _tokenize_slice(args: Tuple[str, int, int, str]) -> List[str]:
         f.seek(start)
         chunk = f.read(end-start).decode("utf-8", errors="ignore")
 
+    # Strip special tokens completely before regex tokenization
+    for sp in special_tokens:
+        chunk = chunk.replace(sp, " ")
+
     counts = Counter()
     for doc in (d for d in SEP_PAT.split(chunk) if d and d not in special_tokens):
         counts.update(_COMP.findall(doc))

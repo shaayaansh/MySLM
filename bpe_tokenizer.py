@@ -9,6 +9,7 @@ from typing import List, Tuple, Iterable, Iterator, Optional, Union
 from collections import Counter
 import unicodedata as ud
 
+
 class BytePairEncodingTokenizer():
     def __init__(self, vocab=None, merges=None, special_tokens=None):
         super().__init__()
@@ -109,7 +110,7 @@ class BytePairEncodingTokenizer():
         
         # base byte tokens (each is a single printable Unicode "byte-char")
         for b in range(256):
-            tok = self.b2u[b]
+            tok = bytes([b])
             self.token_to_id[tok] = len(self.id_to_token)
             self.id_to_token.append(tok)
 
@@ -150,7 +151,12 @@ class BytePairEncodingTokenizer():
 
             all_token_counts.update({k: v * count for k, v in local_counts.items()})
 
-        return all_token_counts.most_common(1)
+        if not all_token_counts:
+            return []
+        
+        # Sort by (-frequency, pair) for deterministic GPT-2 behavior
+        best_pair = sorted(all_token_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        return [best_pair]
     
     @staticmethod
     def _apply_merge_to_seq(seq, a, b, ab):
@@ -176,7 +182,7 @@ class BytePairEncodingTokenizer():
         token_counts = parallelize_tokenize_file(input_path, desired_num_chunks=24, max_workers=8)
         
         corpus = {
-            tuple(self.b2u[b] for b in ud.normalize("NFC", s).encode("utf-8")): freq
+            tuple(bytes([bb]) for bb in s.encode("utf-8")): freq
             for s, freq in token_counts.items()
         }
         
@@ -199,7 +205,7 @@ class BytePairEncodingTokenizer():
                 pbar.update(1)
                 pbar.set_postfix_str(f"last merge: {len(ab)} chars")
         
-        return self.token_to_id, self.merges
+        return {i: tok for i, tok in enumerate(self.id_to_token)}, self.merges
     
     def _encode_word(self, word: str) -> List[str]:
         symbols = [self.b2u[b] for b in word.encode("utf-8")]
@@ -279,3 +285,215 @@ class BytePairEncodingTokenizer():
                 byte_vals.append(self.u2b[ch])
 
         return bytes(byte_vals).decode("utf-8", errors="strict")
+    
+
+
+def bytes_to_unicode():
+    """
+    Returns a dictionary mapping bytes (0–255) to unique printable Unicode strings,
+    following GPT-2’s original byte-to-unicode scheme.
+    """
+    bs = list(range(ord("!"), ord("~") + 1)) + \
+         list(range(ord("¡"), ord("¬") + 1)) + \
+         list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    cs = [chr(c) for c in cs]
+    return dict(zip(bs, cs))
+
+class Tokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+        # === Store byte ↔ unicode mapping ===
+        self.b2u = bytes_to_unicode()
+        self.u2b = {v: k for k, v in self.b2u.items()}
+
+        # === Build merge ranks (pair → rank index) ===
+        self.merges = merges
+        self.merge_ranks = {pair: i for i, pair in enumerate(merges)}
+
+        # === Convert vocab bytes → printable unicode ===
+        self.id_to_token = ["".join(self.b2u[b] for b in token) for _, token in sorted(vocab.items())]
+        self.token_to_id = {tok: i for i, tok in enumerate(self.id_to_token)}
+
+        self._split_pat = re.compile(r" ?\S+|\s+")
+
+        # === Handle special tokens ===
+        self.special_tokens = special_tokens or []
+        for tok in self.special_tokens:
+            if tok not in self.token_to_id:
+                idx = len(self.token_to_id)
+                self.token_to_id[tok] = idx
+                self.id_to_token.append(tok)
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens=None):
+        """Construct a Tokenizer from serialized vocab and merges."""
+        import json
+
+        # Load vocab
+        with open(vocab_filepath, "r", encoding="utf-8") as vf:
+            vocab_dict = json.load(vf)
+            vocab = {int(k): bytes(v.encode("latin-1")) for k, v in vocab_dict.items()}
+
+        # Load merges
+        merges = []
+        with open(merges_filepath, "r", encoding="utf-8") as mf:
+            for line in mf:
+                if line.strip() == "":
+                    continue
+                a, b = line.rstrip().split(" ")
+                merges.append((a.encode("latin-1"), b.encode("latin-1")))
+
+        return cls(vocab, merges, special_tokens=special_tokens)
+
+    # ------------------------------------------------------------------
+    def _bpe(self, token: str) -> list[str]:
+        """Apply BPE merges to a single token (in unicode form)."""
+        # Convert printable Unicode chars back to bytes for merge lookups
+        word = tuple(bytes([self.u2b[c]]) for c in token)
+        pairs = {(word[i], word[i + 1]) for i in range(len(word) - 1)}
+        if not pairs:
+            return [token]
+
+        while True:
+            ranked_pairs = [(self.merge_ranks.get(p, float("inf")), p) for p in pairs]
+            best_rank, best_pair = min(ranked_pairs)
+            if best_rank == float("inf"):
+                break
+
+            first, second = best_pair
+            new_word = []
+            i = 0
+            while i < len(word):
+                if i < len(word) - 1 and word[i] == first and word[i + 1] == second:
+                    new_word.append(first + second)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            word = tuple(new_word)
+            if len(word) == 1:
+                break
+            pairs = {(word[i], word[i + 1]) for i in range(len(word) - 1)}
+
+        # Convert merged bytes back to printable unicode tokens
+        return ["".join(self.b2u[b] for b in w) for w in word]
+
+    def encode(self, text: str) -> list[int]:
+        import regex as re
+
+        specials = self.special_tokens or []
+        specials_sorted = sorted(specials, key=len, reverse=True)
+        pat_special = re.compile("|".join(re.escape(s) for s in specials_sorted)) if specials else None
+
+        # --- Split on special tokens so that they form their own segments ---
+        parts = []
+        if pat_special:
+            # Split text into regular segments and special tokens
+            split_text = re.split(f"({pat_special.pattern})", text)
+            for seg in split_text:
+                if not seg:
+                    continue
+                if seg in specials:
+                    parts.append((True, seg))
+                else:
+                    parts.append((False, seg))
+        else:
+            parts = [(False, text)]
+
+        # --- Encode each segment independently ---
+        out = []
+        for i, (is_special, seg) in enumerate(parts):
+            if is_special:
+                tid = self.token_to_id.get(seg)
+                if tid is not None:
+                    out.append(tid)
+            else:
+                # Check if previous segment was a special token
+                prev_was_special = i > 0 and parts[i - 1][0]
+                
+                if prev_was_special and seg:
+                    # Check if segment matches pattern: MULTIPLE whitespace chars followed by non-whitespace
+                    # Single space + text should be encoded normally (e.g., " are" -> token 389)
+                    # Multiple whitespace + text should be split (e.g., "\n\nHello" -> [198, 198, ...])
+                    if seg and len(seg) > 0:
+                        # Find where non-whitespace starts
+                        ws_end = 0
+                        for ch in seg:
+                            if ch.isspace():
+                                ws_end += 1
+                            else:
+                                break
+                        
+                        # Only split if we have 2+ whitespace chars AND there's non-whitespace after
+                        if ws_end >= 2 and ws_end < len(seg):
+                            ws_part = seg[:ws_end]
+                            rest_part = seg[ws_end:]
+                            
+                            # Encode whitespace part byte-by-byte
+                            ws_bytes = ws_part.encode("utf-8")
+                            ws_printable = "".join(self.b2u[bb] for bb in ws_bytes)
+                            for ch in ws_printable:
+                                cid = self.token_to_id.get(ch)
+                                if cid is not None:
+                                    out.append(cid)
+                            
+                            # Encode rest normally
+                            out.extend(self._encode_regular(rest_part, no_merge=False))
+                        else:
+                            # No split needed (either single space, no leading ws, or only ws)
+                            out.extend(self._encode_regular(seg, no_merge=False))
+                    else:
+                        out.extend(self._encode_regular(seg, no_merge=False))
+                else:
+                    out.extend(self._encode_regular(seg, no_merge=False))
+
+        return out
+
+
+    def _encode_regular(self, text: str, no_merge: bool = False) -> list[int]:
+        b = text.encode("utf-8")
+        printable = "".join(self.b2u[bb] for bb in b)
+        tokens = self._split_pat.findall(printable)
+        out_ids = []
+        
+        for tok in tokens:
+            if no_merge:
+                # Encode byte-by-byte without BPE merges
+                for ch in tok:
+                    cid = self.token_to_id.get(ch)
+                    if cid is not None:
+                        out_ids.append(cid)
+            else:
+                # Normal BPE encoding
+                for sub in self._bpe(tok):
+                    tid = self.token_to_id.get(sub)
+                    if tid is not None:
+                        out_ids.append(tid)
+                    else:
+                        for ch in sub:
+                            cid = self.token_to_id.get(ch)
+                            if cid is not None:
+                                out_ids.append(cid)
+        return out_ids
+            
+    # ------------------------------------------------------------------
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """Lazily encode an iterable of strings."""
+        for text in iterable:
+            for tid in self.encode(text):
+                yield tid
+
+    # ------------------------------------------------------------------
+    def decode(self, ids: list[int]) -> str:
+        """Decode token IDs back to readable text."""
+        # Convert back from printable unicode → bytes
+        text = "".join(self.id_to_token[i] for i in ids)
+        decoded_bytes = bytes([self.u2b[c] for c in text if c in self.u2b])
+        return decoded_bytes.decode("utf-8", errors="replace")
