@@ -1,10 +1,12 @@
 import os
 import re as pyre
 import regex as re
+import numpy as np
 from collections import Counter
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Tuple, List, Iterable, BinaryIO
+from transformers import GPT2Tokenizer
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -109,3 +111,50 @@ def parallelize_tokenize_file(data_path: str, desired_num_chunks: int = None, ma
             token_counts.update(fut.result())
 
     return token_counts
+
+
+
+def count_lines(filename):
+    with open(filename, 'r', encoding='utf-8') as f:
+        return sum(1 for _ in f)
+
+def tokenize_train_data(path: str):
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    eos_token = tokenizer.eos_token_id
+
+    total_lines = count_lines(path)
+
+    if not os.path.exists(path):
+        # tokenize the entire dataset
+        with open(path, "r", encoding="utf-8") as f:
+            with open("train_tokens.bin", "wb") as out:
+                buffer = []
+                current_story = []
+
+                for line in tqdm(f, total=total_lines, desc="Tokenizing Stories"):
+                    line = line.strip()
+
+                    if line == "": # tinystories separates different stories by blank line
+                        story = ' '.join(current_story)
+                        tokens = tokenizer(story)["input_ids"]
+                        tokens.append(eos_token)
+                        buffer.extend(tokens) 
+                        current_story = []
+
+                        # Write buffer periodically
+                        if len(buffer) >= 100000:
+                            np.array(buffer, dtype=np.uint16).tofile(out)
+                            buffer = []
+
+                    else:
+                        current_story.append(line)
+
+                # Handle last story
+                if current_story:
+                    story_text = ' '.join(current_story)
+                    tokens = tokenizer.encode(story_text)
+                    tokens.append(eos_token)
+                    buffer.extend(tokens)
+
+                if buffer:
+                    np.array(buffer, dtype=np.uint16).tofile(out)

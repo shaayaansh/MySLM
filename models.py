@@ -168,6 +168,7 @@ class MultiheadSelfAttention(nn.Module):
         scaled_qk = qk / math.sqrt(d_k)
 
         if mask is not None:
+            mask = mask.to(q.device)
             scaled_qk = scaled_qk.masked_fill(mask, float("-inf"))
 
         attn_weights = torch.softmax(scaled_qk, dim=-1)
@@ -263,8 +264,9 @@ class TransformerLM(nn.Module):
             num_heads: int,
             d_ff: int,
             rope_theta: float,
-            weights: dict[str, torch.Tensor],
+            weights: dict[str, torch.Tensor] = None,
     ):
+        super().__init__()
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.d_model = d_model
@@ -277,7 +279,7 @@ class TransformerLM(nn.Module):
         weights_ln_final = weights.get("ln_final.weight") if weights is not None else None
         weights_lm_head = weights.get("lm_head.weight") if weights is not None else None
 
-        weights_dict = self._reorganize_weights(weights=weights)
+        weights_dict = self._reorganize_weights(weights=weights) if weights is not None else [None] * self.num_layers
         self.transformer_blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -296,7 +298,10 @@ class TransformerLM(nn.Module):
 
     def forward(self, x):
         embeddings = self.embeddings(x)
-        transformer_output = self.transformer_blocks(embeddings)
+        transformer_output = embeddings
+        for block in self.transformer_blocks:
+            transformer_output = block(transformer_output)
+
         normalized = self.rms_norm(transformer_output)
         linear_output = self.lm_head(normalized)
         probs = torch.softmax(linear_output, dim=-1)

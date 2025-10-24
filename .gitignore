@@ -11,6 +11,9 @@ __pycache__/
 # VS Code
 .vscode/
 
+# train tokens
+train_tokens.bin
+
 # Data (keep the folder, ignore contents)
 data/*
 !data/.gitkeep
